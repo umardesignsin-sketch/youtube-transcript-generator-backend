@@ -47,6 +47,9 @@ def extract_video_id(url: str):
 # -----------------------------
 # Home
 # -----------------------------
+@app.get("/hello")
+def hello():
+    return {"message": "This is Umar's transcript API"}
 @app.get("/")
 def home():
     return {
