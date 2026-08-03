@@ -47,14 +47,13 @@ def extract_video_id(url: str):
 # -----------------------------
 # Home
 # -----------------------------
-@app.get("/hello")
-def hello():
-    return {"message": "This is Umar's transcript API"}
+
 @app.get("/")
 def home():
     return {
-        "success": True,
-        "message": "YouTube Transcript API Running 🚀"
+        "owner": "UMAR MIRZA",
+        "project": "YOUTUBE TRANSCRIPT API",
+        "working": True
     }
 
 
