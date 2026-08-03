@@ -56,6 +56,12 @@ def home():
         "working": True
     }
 
+@app.get("/hello")
+def hello():
+    return {
+        "message": "THIS IS UMAR'S BACKEND"
+    }
+
 
 # -----------------------------
 # Transcript Endpoint
