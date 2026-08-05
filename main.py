@@ -16,6 +16,7 @@ import tempfile
 import time
 import logging
 import requests
+import yt_dlp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("api")
@@ -214,6 +215,120 @@ def transcript(request: Request, data: VideoRequest):
             "success": False,
             "message": str(e)
         }
+
+
+# -----------------------------
+# YouTube video downloader
+#
+# YouTube's higher-quality adaptive streams (video-only + audio-only,
+# merged with ffmpeg) increasingly require solving a JS "n challenge"
+# that needs an extra JS runtime (deno) we don't have installed. Rather
+# than silently fail or ship a fragile setup, this sticks to progressive
+# formats (video+audio already combined) — reliable, but capped at
+# whatever resolution YouTube still serves progressively (usually 360p,
+# occasionally higher). Honest > broken.
+# -----------------------------
+MAX_VIDEO_DURATION_SECONDS = 60 * 60  # 1 hour — protects the server from
+# someone pasting a multi-hour stream and tying up disk/bandwidth on it.
+
+youtube_info_cache = TTLCache(maxsize=500, ttl=600)
+
+
+@app.post("/youtube/info")
+@limiter.limit("15/minute")
+def youtube_info(request: Request, data: VideoRequest):
+    video_id = extract_video_id(data.url)
+
+    if not video_id:
+        return {"success": False, "message": "Invalid YouTube URL"}
+
+    if video_id in youtube_info_cache:
+        return youtube_info_cache[video_id]
+
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "format": "best[acodec!=none][vcodec!=none]/best",
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(data.url, download=False)
+
+        duration = info.get("duration") or 0
+
+        if duration and duration > MAX_VIDEO_DURATION_SECONDS:
+            return {
+                "success": False,
+                "message": "This video is too long to download (over 1 hour). Try a shorter video.",
+            }
+
+        result = {
+            "success": True,
+            "video_id": video_id,
+            "title": info.get("title"),
+            "channel": info.get("uploader") or info.get("channel"),
+            "duration": duration,
+            "thumbnail": info.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+            "resolution": info.get("resolution") or info.get("format_note"),
+        }
+
+        youtube_info_cache[video_id] = result
+        return result
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/youtube/download")
+@limiter.limit("5/minute")
+def youtube_download(request: Request, url: str, filename: str = "video.mp4"):
+    video_id = extract_video_id(url)
+
+    if not video_id:
+        return {"success": False, "message": "Invalid YouTube URL"}
+
+    safe_name = re.sub(r'[\\/*?:"<>|]', "_", filename)
+    tmp_dir = tempfile.mkdtemp(prefix="ytdl_")
+
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "best[acodec!=none][vcodec!=none]/best",
+            "outtmpl": os.path.join(tmp_dir, "video.%(ext)s"),
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        duration = info.get("duration") or 0
+        if duration and duration > MAX_VIDEO_DURATION_SECONDS:
+            return {
+                "success": False,
+                "message": "This video is too long to download (over 1 hour).",
+            }
+
+        files = os.listdir(tmp_dir)
+        if not files:
+            return {"success": False, "message": "Download failed"}
+
+        file_path = os.path.join(tmp_dir, files[0])
+
+        with open(file_path, "rb") as f:
+            video_bytes = f.read()
+
+        return StreamingResponse(
+            iter([video_bytes]),
+            media_type="video/mp4",
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+        )
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # -----------------------------
