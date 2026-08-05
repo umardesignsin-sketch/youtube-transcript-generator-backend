@@ -220,18 +220,72 @@ def transcript(request: Request, data: VideoRequest):
 # -----------------------------
 # YouTube video downloader
 #
-# YouTube's higher-quality adaptive streams (video-only + audio-only,
-# merged with ffmpeg) increasingly require solving a JS "n challenge"
-# that needs an extra JS runtime (deno) we don't have installed. Rather
-# than silently fail or ship a fragile setup, this sticks to progressive
-# formats (video+audio already combined) — reliable, but capped at
-# whatever resolution YouTube still serves progressively (usually 360p,
-# occasionally higher). Honest > broken.
+# YouTube's generic "bestvideo" selector reaches for whatever is
+# technically the highest-quality adaptive stream, which increasingly
+# requires solving a JS "n challenge" we don't have a solver for (deno)
+# — that fails outright. Requesting a *specific* format_id instead
+# (e.g. "298" for 720p) reliably works even for adaptive streams, video
+# alone or merged with a specific audio format_id via ffmpeg — verified
+# directly. So: at /youtube/info time we inspect the real formats
+# available for this exact video and offer only what's actually there.
 # -----------------------------
 MAX_VIDEO_DURATION_SECONDS = 60 * 60  # 1 hour — protects the server from
 # someone pasting a multi-hour stream and tying up disk/bandwidth on it.
 
+PREFERRED_HEIGHTS = [1080, 720, 480, 360, 240]
+
 youtube_info_cache = TTLCache(maxsize=500, ttl=600)
+
+
+def get_format_lists(url: str):
+    """Returns (info, formats) from a single extract_info call, reused by
+    both /youtube/info and /youtube/download so they always agree on
+    what's actually available for this video."""
+    ydl_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    return info, info.get("formats", [])
+
+
+def pick_video_qualities(formats):
+    """One best format_id per preferred height, preferring mp4/avc1 for
+    broad player compatibility over webm/av1."""
+    by_height = {}
+    for f in formats:
+        height = f.get("height")
+        if not height or height not in PREFERRED_HEIGHTS:
+            continue
+        if f.get("vcodec") == "none":
+            continue
+        is_mp4 = f.get("ext") == "mp4"
+        existing = by_height.get(height)
+        if existing is None or (is_mp4 and existing["ext"] != "mp4"):
+            by_height[height] = {"format_id": f["format_id"], "ext": f.get("ext")}
+
+    return [
+        {"label": f"{h}p", "format_id": by_height[h]["format_id"]}
+        for h in PREFERRED_HEIGHTS
+        if h in by_height
+    ]
+
+
+def pick_best_audio(formats):
+    """Picks a standard ~128kbps m4a stream over exotic high-bitrate ones —
+    verified those ultra-high-bitrate audio formats (~380kbps+) 403 even
+    when the video streams at the same tier work fine, likely gated
+    behind an entitlement check we don't have. 128kbps m4a is the
+    universally-available, reliably-accessible tier."""
+    audio_formats = [
+        f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"
+    ]
+    if not audio_formats:
+        return None
+
+    m4a = [f for f in audio_formats if f.get("ext") == "m4a" and (f.get("abr") or 0) <= 160]
+    pool = m4a or [f for f in audio_formats if (f.get("abr") or 0) <= 160] or audio_formats
+
+    pool.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+    return pool[0]["format_id"]
 
 
 @app.post("/youtube/info")
@@ -246,14 +300,7 @@ def youtube_info(request: Request, data: VideoRequest):
         return youtube_info_cache[video_id]
 
     try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "format": "best[acodec!=none][vcodec!=none]/best",
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(data.url, download=False)
+        info, formats = get_format_lists(data.url)
 
         duration = info.get("duration") or 0
 
@@ -263,6 +310,18 @@ def youtube_info(request: Request, data: VideoRequest):
                 "message": "This video is too long to download (over 1 hour). Try a shorter video.",
             }
 
+        qualities = pick_video_qualities(formats)
+        has_audio = pick_best_audio(formats) is not None
+
+        if not qualities:
+            # No adaptive formats matched our preferred heights — fall back
+            # to whatever progressive (audio+video already combined) format
+            # exists, which is nearly always available.
+            for f in formats:
+                if f.get("vcodec") != "none" and f.get("acodec") != "none":
+                    qualities = [{"label": f'{f.get("height") or "Standard"}p', "format_id": f["format_id"]}]
+                    break
+
         result = {
             "success": True,
             "video_id": video_id,
@@ -270,7 +329,8 @@ def youtube_info(request: Request, data: VideoRequest):
             "channel": info.get("uploader") or info.get("channel"),
             "duration": duration,
             "thumbnail": info.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
-            "resolution": info.get("resolution") or info.get("format_note"),
+            "qualities": qualities,
+            "has_audio_option": has_audio,
         }
 
         youtube_info_cache[video_id] = result
@@ -282,7 +342,7 @@ def youtube_info(request: Request, data: VideoRequest):
 
 @app.get("/youtube/download")
 @limiter.limit("5/minute")
-def youtube_download(request: Request, url: str, filename: str = "video.mp4"):
+def youtube_download(request: Request, url: str, format_id: str = "", filename: str = "video.mp4"):
     video_id = extract_video_id(url)
 
     if not video_id:
@@ -292,15 +352,7 @@ def youtube_download(request: Request, url: str, filename: str = "video.mp4"):
     tmp_dir = tempfile.mkdtemp(prefix="ytdl_")
 
     try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "best[acodec!=none][vcodec!=none]/best",
-            "outtmpl": os.path.join(tmp_dir, "video.%(ext)s"),
-            "noplaylist": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        info, formats = get_format_lists(url)
 
         duration = info.get("duration") or 0
         if duration and duration > MAX_VIDEO_DURATION_SECONDS:
@@ -309,7 +361,96 @@ def youtube_download(request: Request, url: str, filename: str = "video.mp4"):
                 "message": "This video is too long to download (over 1 hour).",
             }
 
-        files = os.listdir(tmp_dir)
+        if format_id == "audio":
+            audio_id = pick_best_audio(formats)
+            if not audio_id:
+                return {"success": False, "message": "No audio stream available for this video"}
+
+            if shutil.which("ffmpeg") is None:
+                return {
+                    "success": False,
+                    "message": "ffmpeg is not installed on the server, so audio extraction is unavailable.",
+                }
+
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "format": audio_id,
+                "outtmpl": os.path.join(tmp_dir, "audio_src.%(ext)s"),
+                "noplaylist": True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+
+            src_files = [f for f in os.listdir(tmp_dir) if f.startswith("audio_src")]
+            if not src_files:
+                return {"success": False, "message": "Audio download failed"}
+
+            src_path = os.path.join(tmp_dir, src_files[0])
+            mp3_path = os.path.join(tmp_dir, "output.mp3")
+
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", src_path, "-vn", "-acodec", "libmp3lame", "-q:a", "2", mp3_path],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode != 0 or not os.path.exists(mp3_path):
+                return {"success": False, "message": "Audio conversion failed"}
+
+            with open(mp3_path, "rb") as f:
+                audio_bytes = f.read()
+
+            mp3_name = re.sub(r"\.mp4$", ".mp3", safe_name, flags=re.IGNORECASE)
+            if not mp3_name.lower().endswith(".mp3"):
+                mp3_name += ".mp3"
+
+            return StreamingResponse(
+                iter([audio_bytes]),
+                media_type="audio/mpeg",
+                headers={"Content-Disposition": f'attachment; filename="{mp3_name}"'},
+            )
+
+        # Video path: use the requested format_id if it's still valid for
+        # this video, otherwise fall back to the best available quality.
+        valid_ids = {f["format_id"] for f in formats}
+        chosen_format = format_id if format_id in valid_ids else None
+
+        if not chosen_format:
+            qualities = pick_video_qualities(formats)
+            if qualities:
+                chosen_format = qualities[0]["format_id"]
+
+        if not chosen_format:
+            for f in formats:
+                if f.get("vcodec") != "none" and f.get("acodec") != "none":
+                    chosen_format = f["format_id"]
+                    break
+
+        if not chosen_format:
+            return {"success": False, "message": "No downloadable format found for this video"}
+
+        # If the chosen format is video-only, merge with the best audio.
+        chosen_meta = next((f for f in formats if f["format_id"] == chosen_format), None)
+        needs_audio = chosen_meta and chosen_meta.get("acodec") == "none"
+
+        format_selector = chosen_format
+        if needs_audio:
+            audio_id = pick_best_audio(formats)
+            if audio_id:
+                format_selector = f"{chosen_format}+{audio_id}"
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": format_selector,
+            "merge_output_format": "mp4",
+            "outtmpl": os.path.join(tmp_dir, "video.%(ext)s"),
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=True)
+
+        files = [f for f in os.listdir(tmp_dir) if f.startswith("video")]
         if not files:
             return {"success": False, "message": "Download failed"}
 
