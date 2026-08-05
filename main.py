@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import traceback
 import requests
 import instaloader
 
@@ -298,8 +299,14 @@ def get_instagram_loader(require_login: bool = False):
         try:
             _ig_loader.load_session_from_file(IG_USERNAME, IG_SESSION_FILE)
         except FileNotFoundError:
-            _ig_loader.login(IG_USERNAME, IG_PASSWORD)
-            _ig_loader.save_session_to_file(IG_SESSION_FILE)
+            try:
+                _ig_loader.login(IG_USERNAME, IG_PASSWORD)
+                _ig_loader.save_session_to_file(IG_SESSION_FILE)
+            except Exception:
+                print("=== Instagram login failed — full traceback ===")
+                traceback.print_exc()
+                print("================================================")
+                raise
 
     return _ig_loader
 
