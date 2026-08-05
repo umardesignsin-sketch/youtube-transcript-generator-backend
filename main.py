@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+import requests
 
 app = FastAPI(title="YouTube Transcript API")
 
@@ -41,6 +42,31 @@ def extract_video_id(url: str):
             return match.group(1)
 
     return None
+
+
+# -----------------------------
+# oEmbed lookup (title/channel/thumbnail, no API key needed)
+# -----------------------------
+def get_oembed(video_id: str):
+    try:
+        res = requests.get(
+            "https://www.youtube.com/oembed",
+            params={
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "format": "json",
+            },
+            timeout=5,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            return {
+                "title": data.get("title"),
+                "channel": data.get("author_name"),
+            }
+    except Exception:
+        pass
+
+    return {"title": None, "channel": None}
 
 
 # -----------------------------
@@ -102,16 +128,27 @@ def transcript(data: VideoRequest):
             )
 
         transcript = transcript_obj.fetch()
+        raw = transcript.to_raw_data()
+
+        duration = 0
+        if raw:
+            last = raw[-1]
+            duration = round(last.get("start", 0) + last.get("duration", 0))
+
+        oembed = get_oembed(video_id)
 
         return {
             "success": True,
             "video_id": video_id,
+            "title": oembed["title"],
+            "channel": oembed["channel"],
+            "duration": duration,
             "thumbnail": f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
             "selected_language": transcript_obj.language,
             "selected_language_code": transcript_obj.language_code,
             "generated": transcript_obj.is_generated,
             "available_languages": available_languages,
-            "transcript": transcript.to_raw_data()
+            "transcript": raw
         }
 
     except Exception as e:
