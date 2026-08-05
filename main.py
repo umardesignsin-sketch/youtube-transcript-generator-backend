@@ -9,9 +9,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-import traceback
 import requests
-import instaloader
 
 app = FastAPI(title="YouTube Transcript API")
 
@@ -258,149 +256,16 @@ def pinterest_download(data: MediaRequest):
 
 
 # -----------------------------
-# Instagram
-# -----------------------------
-IG_USERNAME = os.environ.get("IG_USERNAME")
-IG_PASSWORD = os.environ.get("IG_PASSWORD")
-IG_SESSION_FILE = "ig_session"
-
-_ig_loader = None
-
-
-def get_instagram_loader(require_login: bool = False):
-    """Reuses a single Instaloader instance across requests. Instagram
-    aggressively rate-limits anonymous scraping (observed 429s after a
-    single request in testing), so in practice every endpoint here needs
-    a logged-in session, not just Stories. Logs in lazily (once) and
-    caches the session to disk. IG_USERNAME/IG_PASSWORD must be set on
-    the server — use a secondary account, not your main one, since
-    automated access risks a challenge/ban on the account."""
-    global _ig_loader
-
-    if _ig_loader is None:
-        _ig_loader = instaloader.Instaloader(
-            download_pictures=False,
-            download_videos=False,
-            download_video_thumbnails=False,
-            download_geotags=False,
-            download_comments=False,
-            save_metadata=False,
-            compress_json=False,
-        )
-
-    if require_login and not _ig_loader.context.is_logged_in:
-        if not IG_USERNAME or not IG_PASSWORD:
-            raise RuntimeError(
-                "Instagram downloads need a login configured on the server "
-                "(IG_USERNAME / IG_PASSWORD env vars) — anonymous access gets "
-                "rate-limited by Instagram almost immediately. Use a secondary "
-                "account, not your main one."
-            )
-        try:
-            _ig_loader.load_session_from_file(IG_USERNAME, IG_SESSION_FILE)
-        except FileNotFoundError:
-            try:
-                _ig_loader.login(IG_USERNAME, IG_PASSWORD)
-                _ig_loader.save_session_to_file(IG_SESSION_FILE)
-            except Exception:
-                print("=== Instagram login failed — full traceback ===")
-                traceback.print_exc()
-                print("================================================")
-                raise
-
-    return _ig_loader
-
-
-def extract_instagram_shortcode(url: str):
-    match = re.search(r"instagram\.com/(?:reels?|p|tv)/([A-Za-z0-9_-]+)", url)
-    return match.group(1) if match else None
-
-
-def extract_instagram_username(url: str):
-    match = re.search(r"instagram\.com/stories/([A-Za-z0-9_.]+)", url)
-    return match.group(1) if match else None
-
-
-@app.post("/instagram/download")
-def instagram_download(data: MediaRequest):
-    shortcode = extract_instagram_shortcode(data.url)
-
-    if not shortcode:
-        return {
-            "success": False,
-            "message": "Invalid Instagram post/reel URL",
-        }
-
-    try:
-        loader = get_instagram_loader(require_login=True)
-        post = instaloader.Post.from_shortcode(loader.context, shortcode)
-
-        return {
-            "success": True,
-            "shortcode": shortcode,
-            "caption": (post.caption or "")[:500],
-            "owner": post.owner_username,
-            "thumbnail": post.url,
-            "is_video": post.is_video,
-            "video": post.video_url if post.is_video else None,
-            "image": None if post.is_video else post.url,
-        }
-
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
-
-@app.post("/instagram/story")
-def instagram_story(data: MediaRequest):
-    username = extract_instagram_username(data.url)
-
-    if not username:
-        return {
-            "success": False,
-            "message": "Invalid Instagram story URL — expected https://www.instagram.com/stories/<username>/",
-        }
-
-    try:
-        loader = get_instagram_loader(require_login=True)
-        profile = instaloader.Profile.from_username(loader.context, username)
-
-        items = []
-        stories = loader.get_stories(userids=[profile.userid])
-
-        for story in stories:
-            for item in story.get_items():
-                items.append({
-                    "is_video": item.is_video,
-                    "video": item.video_url if item.is_video else None,
-                    "image": item.url,
-                    "expiring_at": item.expiring_utc.isoformat() if item.expiring_utc else None,
-                })
-
-        if not items:
-            return {
-                "success": False,
-                "message": "No active stories found for this account (stories expire after 24 hours).",
-            }
-
-        return {"success": True, "username": username, "items": items}
-
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
-
-# -----------------------------
 # Download proxy
 #
-# Pinterest/Instagram CDN URLs are cross-origin, so a plain <a download>
-# won't reliably force a save — browsers just navigate to them instead.
+# Pinterest's CDN URLs are cross-origin, so a plain <a download> won't
+# reliably force a save — browsers just navigate to them instead.
 # Streaming the bytes through our own server with a Content-Disposition
 # header guarantees a real download. Restricted to known media CDNs only,
 # so this can't be abused as an open SSRF proxy.
 # -----------------------------
 ALLOWED_DOWNLOAD_HOSTS = (
     "pinimg.com",
-    "cdninstagram.com",
-    "fbcdn.net",
 )
 
 
