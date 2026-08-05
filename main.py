@@ -312,7 +312,7 @@ def get_instagram_loader(require_login: bool = False):
 
 
 def extract_instagram_shortcode(url: str):
-    match = re.search(r"instagram\.com/(?:reel|p|tv)/([A-Za-z0-9_-]+)", url)
+    match = re.search(r"instagram\.com/(?:reels?|p|tv)/([A-Za-z0-9_-]+)", url)
     return match.group(1) if match else None
 
 
