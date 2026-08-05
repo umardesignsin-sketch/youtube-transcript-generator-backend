@@ -1,17 +1,35 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from urllib.parse import urlparse
 from youtube_transcript_api import YouTubeTranscriptApi
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from cachetools import TTLCache
 import re
 import os
 import shutil
 import subprocess
 import tempfile
+import time
+import logging
 import requests
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+logger = logging.getLogger("api")
+
+# -----------------------------
+# Rate limiting (in-memory — fine for a single process; if this ever
+# runs as multiple replicas behind a load balancer, swap the storage_uri
+# for a shared Redis backend so limits are enforced across instances)
+# -----------------------------
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(title="YouTube Transcript API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # -----------------------------
 # CORS
@@ -23,6 +41,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# -----------------------------
+# Request logging
+#
+# No third-party observability tool wired up yet — this at least makes
+# traffic and errors visible in the server's own logs.
+# -----------------------------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration_ms = round((time.time() - start) * 1000)
+    logger.info(
+        f'{request.client.host if request.client else "-"} '
+        f'"{request.method} {request.url.path}" '
+        f"{response.status_code} {duration_ms}ms"
+    )
+    return response
+
 
 # -----------------------------
 # Request Model
@@ -95,9 +133,17 @@ def hello():
 
 # -----------------------------
 # Transcript Endpoint
+#
+# Cached by video_id — a popular video gets hit by many people, and the
+# transcript itself doesn't change, so there's no reason to re-fetch it
+# from YouTube every time.
 # -----------------------------
+transcript_cache = TTLCache(maxsize=1000, ttl=3600)
+
+
 @app.post("/transcript")
-def transcript(data: VideoRequest):
+@limiter.limit("20/minute")
+def transcript(request: Request, data: VideoRequest):
 
     video_id = extract_video_id(data.url)
 
@@ -106,6 +152,9 @@ def transcript(data: VideoRequest):
             "success": False,
             "message": "Invalid YouTube URL"
         }
+
+    if video_id in transcript_cache:
+        return transcript_cache[video_id]
 
     try:
 
@@ -143,7 +192,7 @@ def transcript(data: VideoRequest):
 
         oembed = get_oembed(video_id)
 
-        return {
+        result = {
             "success": True,
             "video_id": video_id,
             "title": oembed["title"],
@@ -156,6 +205,9 @@ def transcript(data: VideoRequest):
             "available_languages": available_languages,
             "transcript": raw
         }
+
+        transcript_cache[video_id] = result
+        return result
 
     except Exception as e:
         return {
@@ -212,12 +264,21 @@ def find_first_mp4(node):
     return None
 
 
+# Shorter TTL than YouTube — Pinterest's CDN URLs (pinimg.com/v1.pinimg.com)
+# can rotate, so we don't want to hand out a stale link for too long.
+pinterest_cache = TTLCache(maxsize=1000, ttl=600)
+
+
 @app.post("/pinterest/download")
-def pinterest_download(data: MediaRequest):
+@limiter.limit("20/minute")
+def pinterest_download(request: Request, data: MediaRequest):
     pin_id = extract_pinterest_pin_id(data.url)
 
     if not pin_id:
         return {"success": False, "message": "Invalid Pinterest URL"}
+
+    if pin_id in pinterest_cache:
+        return pinterest_cache[pin_id]
 
     try:
         res = requests.get(
@@ -241,7 +302,7 @@ def pinterest_download(data: MediaRequest):
 
         video_url = find_first_mp4(pin)
 
-        return {
+        result = {
             "success": True,
             "pin_id": pin_id,
             "title": pin.get("description") or pin.get("title") or "Pinterest Pin",
@@ -250,6 +311,9 @@ def pinterest_download(data: MediaRequest):
             "video": video_url,
             "image": thumbnail,
         }
+
+        pinterest_cache[pin_id] = result
+        return result
 
     except Exception as e:
         return {"success": False, "message": str(e)}
@@ -270,7 +334,8 @@ ALLOWED_DOWNLOAD_HOSTS = (
 
 
 @app.get("/download-file")
-def download_file(url: str, filename: str = "download"):
+@limiter.limit("30/minute")
+def download_file(request: Request, url: str, filename: str = "download"):
     host = urlparse(url).hostname or ""
 
     if not any(host == h or host.endswith("." + h) for h in ALLOWED_DOWNLOAD_HOSTS):
@@ -301,10 +366,12 @@ def download_file(url: str, filename: str = "download"):
 #
 # Reels/pins don't have a separate audio-only stream, so "download audio"
 # means: download the video, pull the audio track out with ffmpeg, serve
-# that. Runs in a temp dir that's always cleaned up.
+# that. Runs in a temp dir that's always cleaned up. Tighter rate limit —
+# this is the most CPU/bandwidth-expensive endpoint.
 # -----------------------------
 @app.get("/extract-audio")
-def extract_audio(url: str, filename: str = "audio.mp3"):
+@limiter.limit("10/minute")
+def extract_audio(request: Request, url: str, filename: str = "audio.mp3"):
     host = urlparse(url).hostname or ""
 
     if not any(host == h or host.endswith("." + h) for h in ALLOWED_DOWNLOAD_HOSTS):
