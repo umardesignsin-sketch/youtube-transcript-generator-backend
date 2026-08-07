@@ -319,7 +319,7 @@ def youtube_info(request: Request, data: VideoRequest):
             # exists, which is nearly always available.
             for f in formats:
                 if f.get("vcodec") != "none" and f.get("acodec") != "none":
-                    qualities = [{"label": f'{f.get("height") or "Standard"}p', "format_id": f["format_id"]}]
+                    qualities = [{"label": f'{f["height"]}p' if f.get("height") else "Standard", "format_id": f["format_id"]}]
                     break
 
         result = {
@@ -430,6 +430,211 @@ def youtube_download(request: Request, url: str, format_id: str = "", filename: 
             return {"success": False, "message": "No downloadable format found for this video"}
 
         # If the chosen format is video-only, merge with the best audio.
+        chosen_meta = next((f for f in formats if f["format_id"] == chosen_format), None)
+        needs_audio = chosen_meta and chosen_meta.get("acodec") == "none"
+
+        format_selector = chosen_format
+        if needs_audio:
+            audio_id = pick_best_audio(formats)
+            if audio_id:
+                format_selector = f"{chosen_format}+{audio_id}"
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": format_selector,
+            "merge_output_format": "mp4",
+            "outtmpl": os.path.join(tmp_dir, "video.%(ext)s"),
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(url, download=True)
+
+        files = [f for f in os.listdir(tmp_dir) if f.startswith("video")]
+        if not files:
+            return {"success": False, "message": "Download failed"}
+
+        file_path = os.path.join(tmp_dir, files[0])
+
+        with open(file_path, "rb") as f:
+            video_bytes = f.read()
+
+        return StreamingResponse(
+            iter([video_bytes]),
+            media_type="video/mp4",
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+        )
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# -----------------------------
+# Social platform downloaders (Facebook, TikTok, Reddit, Threads,
+# Dailymotion) — all handled through yt-dlp's built-in extractors, sharing
+# the same format-selection helpers as YouTube above. Unlike YouTube, these
+# platforms typically only expose one or two progressive (already-merged)
+# formats rather than a full adaptive-height ladder, so pick_video_qualities
+# usually returns a short list — that's expected, not a bug.
+# -----------------------------
+PLATFORM_DOMAINS = {
+    "facebook": ("facebook.com", "fb.watch"),
+    "tiktok": ("tiktok.com",),
+    "reddit": ("reddit.com", "redd.it"),
+    "threads": ("threads.net", "threads.com"),
+    "dailymotion": ("dailymotion.com", "dai.ly"),
+}
+
+
+def detect_platform(url: str):
+    host = urlparse(url).hostname or ""
+    host = host.lower().removeprefix("www.").removeprefix("m.")
+    for platform, domains in PLATFORM_DOMAINS.items():
+        if any(host == d or host.endswith("." + d) for d in domains):
+            return platform
+    return None
+
+
+social_info_cache = TTLCache(maxsize=500, ttl=600)
+
+
+@app.post("/social/info")
+@limiter.limit("15/minute")
+def social_info(request: Request, data: VideoRequest):
+    platform = detect_platform(data.url)
+    if not platform:
+        return {"success": False, "message": "Unsupported or unrecognized URL"}
+
+    cache_key = f"{platform}:{data.url}"
+    if cache_key in social_info_cache:
+        return social_info_cache[cache_key]
+
+    try:
+        info, formats = get_format_lists(data.url)
+
+        duration = info.get("duration") or 0
+        if duration and duration > MAX_VIDEO_DURATION_SECONDS:
+            return {
+                "success": False,
+                "message": "This video is too long to download (over 1 hour). Try a shorter video.",
+            }
+
+        qualities = pick_video_qualities(formats)
+        has_audio = pick_best_audio(formats) is not None
+
+        if not qualities:
+            for f in formats:
+                if f.get("vcodec") != "none" and f.get("acodec") != "none":
+                    qualities = [{"label": f'{f["height"]}p' if f.get("height") else "Standard", "format_id": f["format_id"]}]
+                    break
+
+        if not qualities:
+            return {"success": False, "message": "No downloadable video found at this URL"}
+
+        result = {
+            "success": True,
+            "platform": platform,
+            "title": info.get("title") or f"{platform.capitalize()} video",
+            "uploader": info.get("uploader") or info.get("channel"),
+            "duration": duration,
+            "thumbnail": info.get("thumbnail"),
+            "qualities": qualities,
+            "has_audio_option": has_audio,
+        }
+
+        social_info_cache[cache_key] = result
+        return result
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/social/download")
+@limiter.limit("5/minute")
+def social_download(request: Request, url: str, format_id: str = "", filename: str = "video.mp4"):
+    platform = detect_platform(url)
+    if not platform:
+        return {"success": False, "message": "Unsupported or unrecognized URL"}
+
+    safe_name = re.sub(r'[\\/*?:"<>|]', "_", filename)
+    tmp_dir = tempfile.mkdtemp(prefix="social_")
+
+    try:
+        info, formats = get_format_lists(url)
+
+        duration = info.get("duration") or 0
+        if duration and duration > MAX_VIDEO_DURATION_SECONDS:
+            return {"success": False, "message": "This video is too long to download (over 1 hour)."}
+
+        if format_id == "audio":
+            audio_id = pick_best_audio(formats)
+            if not audio_id:
+                return {"success": False, "message": "No audio stream available for this video"}
+
+            if shutil.which("ffmpeg") is None:
+                return {
+                    "success": False,
+                    "message": "ffmpeg is not installed on the server, so audio extraction is unavailable.",
+                }
+
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "format": audio_id,
+                "outtmpl": os.path.join(tmp_dir, "audio_src.%(ext)s"),
+                "noplaylist": True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(url, download=True)
+
+            src_files = [f for f in os.listdir(tmp_dir) if f.startswith("audio_src")]
+            if not src_files:
+                return {"success": False, "message": "Audio download failed"}
+
+            src_path = os.path.join(tmp_dir, src_files[0])
+            mp3_path = os.path.join(tmp_dir, "output.mp3")
+
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", src_path, "-vn", "-acodec", "libmp3lame", "-q:a", "2", mp3_path],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode != 0 or not os.path.exists(mp3_path):
+                return {"success": False, "message": "Audio conversion failed"}
+
+            with open(mp3_path, "rb") as f:
+                audio_bytes = f.read()
+
+            mp3_name = re.sub(r"\.mp4$", ".mp3", safe_name, flags=re.IGNORECASE)
+            if not mp3_name.lower().endswith(".mp3"):
+                mp3_name += ".mp3"
+
+            return StreamingResponse(
+                iter([audio_bytes]),
+                media_type="audio/mpeg",
+                headers={"Content-Disposition": f'attachment; filename="{mp3_name}"'},
+            )
+
+        valid_ids = {f["format_id"] for f in formats}
+        chosen_format = format_id if format_id in valid_ids else None
+
+        if not chosen_format:
+            qualities = pick_video_qualities(formats)
+            if qualities:
+                chosen_format = qualities[0]["format_id"]
+
+        if not chosen_format:
+            for f in formats:
+                if f.get("vcodec") != "none" and f.get("acodec") != "none":
+                    chosen_format = f["format_id"]
+                    break
+
+        if not chosen_format:
+            return {"success": False, "message": "No downloadable format found for this video"}
+
         chosen_meta = next((f for f in formats if f["format_id"] == chosen_format), None)
         needs_audio = chosen_meta and chosen_meta.get("acodec") == "none"
 
